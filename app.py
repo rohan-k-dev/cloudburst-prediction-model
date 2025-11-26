@@ -10,8 +10,6 @@ import os
 import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
-import torch
-from transformers import pipeline
 
 # Import your verification scraper
 try:
@@ -114,82 +112,104 @@ def load_model_columns():
         st.error(f"Error loading model columns: {e}")
         return None
 
+def get_safe_gfs_date():
+    """Determine the latest 'Safe' GFS cycle (allowing ~4 hours lag for upload)"""
+    now_utc = datetime.utcnow()
+    hour = now_utc.hour
+    
+    if hour >= 22:
+        run_date = now_utc.replace(hour=18, minute=0, second=0, microsecond=0)
+    elif hour >= 16:
+        run_date = now_utc.replace(hour=12, minute=0, second=0, microsecond=0)
+    elif hour >= 10:
+        run_date = now_utc.replace(hour=6, minute=0, second=0, microsecond=0)
+    elif hour >= 4:
+        run_date = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        # Hours 0-3: Use previous day's 18z cycle
+        run_date = (now_utc - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+        
+    return run_date
+
 def fetch_gfs_data_for_location(lat, lon, radius=0.5):
-    """Fetch GFS data for a specific location"""
+    """Fetch GFS data with automatic fallback to previous cycle"""
     try:
-        # Determine latest GFS cycle
-        now_utc = datetime.utcnow()
-        hour = now_utc.hour
-        if hour >= 22: cycle = 18
-        elif hour >= 16: cycle = 12
-        elif hour >= 10: cycle = 6
-        else: cycle = 0
+        # 1. Get Primary Date
+        run_date = get_safe_gfs_date()
+
+        # 2. Define helper to try fetching
+        def try_fetch(target_date):
+            H = Herbie(
+                date=target_date,
+                model='gfs',
+                product='pgrb2.0p25',
+                fxx=6,
+                save_dir='herbie_cache',
+                verbose=True
+            )
+            
+            min_lat, max_lat = lat - radius, lat + radius
+            min_lon, max_lon = lon - radius, lon + radius
+            
+            variables = {
+                'dpt': ':DPT:2 m above', 
+                'lhtfl': ':LHTFL:surface', 
+                'shtfl': ':SHTFL:surface', 
+                'tcdc': ':TCDC:entire atmosphere', 
+                'cwat': ':CWAT:', 
+                'ugrd': ':UGRD:10 m above', 
+                'vgrd': ':VGRD:10 m above',
+                'apcp': ':APCP:surface',
+                'tmp': ':TMP:2 m above'
+            }
+            
+            data_dict = {}
+            coords_ref = None
+            
+            for var, search in variables.items():
+                try:
+                    ds = H.xarray(search, remove_grib=False)
+                    if isinstance(ds, list): ds = ds[0]
+                    
+                    ds = ds.sel(
+                        latitude=slice(max_lat, min_lat), 
+                        longitude=slice(min_lon, max_lon)
+                    )
+                    
+                    val_key = list(ds.data_vars.keys())[0]
+                    data_dict[var] = ds[val_key].values.flatten()
+                    
+                    if coords_ref is None:
+                        lats = ds.latitude.values
+                        lons = ds.longitude.values
+                        lon_grid, lat_grid = np.meshgrid(lons, lats)
+                        coords_ref = {'lat': lat_grid.flatten(), 'lon': lon_grid.flatten()}
+                except:
+                    if var in ['apcp', 'tmp']:
+                        data_dict[var] = None
+                    pass
+            
+            return data_dict, coords_ref
+
+        # 3. Attempt Primary Fetch
+        st.info(f"📡 Attempting to fetch GFS Cycle: {run_date.strftime('%Y-%m-%d %H')}z")
+        all_data, coords = try_fetch(run_date)
         
-        forecast_date = now_utc.replace(hour=cycle, minute=0, second=0, microsecond=0)
-        if cycle == 18 and hour < 4: 
-            forecast_date -= timedelta(days=1)
-        
-        # Connect to Herbie
-        H = Herbie(
-            date=forecast_date, 
-            model='gfs', 
-            product='pgrb2.0p25', 
-            fxx=6, 
-            save_dir='herbie_cache'
-        )
-        
-        # Define box around location
-        min_lat, max_lat = lat - radius, lat + radius
-        min_lon, max_lon = lon - radius, lon + radius
-        
-        # Variables to fetch
-        variables = {
-            'dpt': ':DPT:2 m above', 
-            'lhtfl': ':LHTFL:surface', 
-            'shtfl': ':SHTFL:surface', 
-            'tcdc': ':TCDC:entire atmosphere', 
-            'cwat': ':CWAT:', 
-            'ugrd': ':UGRD:10 m above', 
-            'vgrd': ':VGRD:10 m above',
-            'apcp': ':APCP:surface',
-            'tmp': ':TMP:2 m above'
-        }
-        
-        all_data = {}
-        coords = None
-        
-        for var, search in variables.items():
-            try:
-                ds = H.xarray(search)
-                if isinstance(ds, list): ds = ds[0]
-                
-                ds = ds.sel(
-                    latitude=slice(max_lat, min_lat), 
-                    longitude=slice(min_lon, max_lon)
-                )
-                
-                val_key = list(ds.data_vars.keys())[0]
-                all_data[var] = ds[val_key].values.flatten()
-                
-                if coords is None:
-                    lats = ds.latitude.values
-                    lons = ds.longitude.values
-                    lon_grid, lat_grid = np.meshgrid(lons, lats)
-                    coords = {'lat': lat_grid.flatten(), 'lon': lon_grid.flatten()}
-            except:
-                if var in ['apcp', 'tmp']:
-                    all_data[var] = None
-                pass
-        
+        # 4. Fallback if failed
+        if not all_data or coords is None:
+            st.warning("⚠️ Latest cycle not ready/incomplete. Falling back to previous cycle...")
+            fallback_date = run_date - timedelta(hours=6)
+            all_data, coords = try_fetch(fallback_date)
+            
         if not all_data or coords is None:
             return None
         
+        # 5. Build DataFrame
         df = pd.DataFrame(coords)
         for v, d in all_data.items(): 
             if d is not None: 
                 df[v] = d
         
-        # Fill missing values
         if 'apcp' not in df.columns: df['apcp'] = 0.0
         if 'tmp' not in df.columns: df['tmp'] = 290.0
         
@@ -197,6 +217,86 @@ def fetch_gfs_data_for_location(lat, lon, radius=0.5):
         
     except Exception as e:
         st.error(f"Error fetching GFS data: {e}")
+        return None
+
+def fetch_india_wide_data():
+    """Fetch GFS data for entire India with fallback logic"""
+    try:
+        # 1. Get Primary Date
+        run_date = get_safe_gfs_date()
+        
+        # 2. Define helper
+        def try_fetch_india(target_date):
+            H = Herbie(
+                date=target_date, 
+                model='gfs', 
+                product='pgrb2.0p25', 
+                fxx=6, 
+                save_dir='herbie_cache'
+            )
+            
+            variables = {
+                'dpt': ':DPT:2 m above', 
+                'lhtfl': ':LHTFL:surface',
+                'shtfl': ':SHTFL:surface', 
+                'tcdc': ':TCDC:entire atmosphere',
+                'cwat': ':CWAT:', 
+                'ugrd': ':UGRD:10 m above',
+                'vgrd': ':VGRD:10 m above',
+                'apcp': ':APCP:surface',
+                'tmp': ':TMP:2 m above'
+            }
+            
+            data_dict = {}
+            coords_ref = None
+            
+            for v, s in variables.items():
+                try:
+                    ds = H.xarray(s, remove_grib=False)
+                    if isinstance(ds, list): ds = ds[0]
+                    
+                    # Crop to Indian subcontinent
+                    ds = ds.sel(latitude=slice(37, 6), longitude=slice(68, 98))
+                    
+                    val_key = list(ds.data_vars.keys())[0]
+                    data_dict[v] = ds[val_key].values.flatten()
+                    
+                    if coords_ref is None:
+                        lats = ds.latitude.values
+                        lons = ds.longitude.values
+                        lon_grid, lat_grid = np.meshgrid(lons, lats)
+                        coords_ref = {'lat': lat_grid.flatten(), 'lon': lon_grid.flatten()}
+                except:
+                    if v in ['apcp', 'tmp']:
+                        data_dict[v] = None
+                    pass
+            return data_dict, coords_ref
+
+        # 3. Attempt Primary Fetch
+        st.info(f"📡 Scanning India using GFS Cycle: {run_date.strftime('%Y-%m-%d %H')}z")
+        all_data, coords = try_fetch_india(run_date)
+        
+        # 4. Fallback
+        if not all_data or coords is None:
+            st.warning("⚠️ Latest cycle incomplete. Scanning with previous cycle...")
+            fallback_date = run_date - timedelta(hours=6)
+            all_data, coords = try_fetch_india(fallback_date)
+
+        if coords is None:
+            return None
+            
+        df = pd.DataFrame(coords)
+        for v, d in all_data.items():
+            if d is not None:
+                df[v] = d
+        
+        if 'apcp' not in df.columns: df['apcp'] = 0.0
+        if 'tmp' not in df.columns: df['tmp'] = 290.0
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"Error fetching India-wide data: {e}")
         return None
 
 def process_data_for_prediction(df_raw):
@@ -238,7 +338,7 @@ def predict_cloudburst_location(lat, lon, location_name):
         df_raw = fetch_gfs_data_for_location(lat, lon)
     
     if df_raw is None:
-        st.error("Failed to fetch GFS data")
+        st.error("Failed to fetch GFS data (Network or Source Error)")
         return None
     
     # Process data
@@ -338,81 +438,6 @@ def run_verification(location_name):
     except Exception as e:
         st.error(f"Verification error: {e}")
         return 0.0, 0, []
-
-def fetch_india_wide_data():
-    """Fetch GFS data for entire India"""
-    try:
-        now_utc = datetime.utcnow()
-        hour = now_utc.hour
-        if hour >= 22: cycle = 18
-        elif hour >= 16: cycle = 12
-        elif hour >= 10: cycle = 6
-        else: cycle = 0
-        
-        forecast_date = now_utc.replace(hour=cycle, minute=0, second=0, microsecond=0)
-        if cycle == 18 and hour < 4:
-            forecast_date -= timedelta(days=1)
-        
-        H = Herbie(
-            date=forecast_date, 
-            model='gfs', 
-            product='pgrb2.0p25', 
-            fxx=6, 
-            save_dir='herbie_cache'
-        )
-        
-        variables = {
-            'dpt': ':DPT:2 m above', 
-            'lhtfl': ':LHTFL:surface',
-            'shtfl': ':SHTFL:surface', 
-            'tcdc': ':TCDC:entire atmosphere',
-            'cwat': ':CWAT:', 
-            'ugrd': ':UGRD:10 m above',
-            'vgrd': ':VGRD:10 m above',
-            'apcp': ':APCP:surface',
-            'tmp': ':TMP:2 m above'
-        }
-        
-        all_data = {}
-        coords = None
-        
-        for v, s in variables.items():
-            try:
-                ds = H.xarray(s)
-                if isinstance(ds, list): ds = ds[0]
-                
-                # Crop to Indian subcontinent
-                ds = ds.sel(latitude=slice(37, 6), longitude=slice(68, 98))
-                
-                val_key = list(ds.data_vars.keys())[0]
-                all_data[v] = ds[val_key].values.flatten()
-                
-                if coords is None:
-                    lats = ds.latitude.values
-                    lons = ds.longitude.values
-                    lon_grid, lat_grid = np.meshgrid(lons, lats)
-                    coords = {'lat': lat_grid.flatten(), 'lon': lon_grid.flatten()}
-            except:
-                if v in ['apcp', 'tmp']:
-                    all_data[v] = np.zeros_like(list(all_data.values())[0]) if all_data else None
-                pass
-        
-        if coords is None:
-            return None
-            
-        df = pd.DataFrame(coords)
-        for v, d in all_data.items():
-            if d is not None:
-                df[v] = d
-        
-        if 'apcp' not in df.columns: df['apcp'] = 0.0
-        if 'tmp' not in df.columns: df['tmp'] = 290.0
-        
-        return df
-        
-    except Exception as e:
-        st.error(f"Error fetching India-wide data: {e}")
-        return None
 
 # Main App
 def main():
@@ -571,7 +596,7 @@ def main():
                 df_raw = fetch_india_wide_data()
             
             if df_raw is None:
-                st.error("Failed to fetch data")
+                st.error("Failed to fetch data. Check logs above.")
                 return
             
             # Process data
